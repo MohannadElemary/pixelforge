@@ -7,28 +7,31 @@ use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Validator;
 use UnexpectedValueException;
 
-class Pricing
+class PricingService
 {
     public const ZERO = '0.000000000000000000';
 
     public const BUCKETS = ['input_text_tokens', 'input_image_tokens', 'output_tokens', 'reasoning_tokens'];
 
-    public function __construct(private readonly PixelforgeClient $provider) {}
+    public function __construct(private readonly PixelforgeClient $pixelforgeClient) {}
 
     public function current(): array
     {
-        return Cache::remember('pixelforge.pricing', 60, function (): array {
-            $pricing = $this->provider->pricing();
-            if (! is_array($pricing['rates'] ?? null)) {
-                throw new UnexpectedValueException('Invalid pricing rates.');
-            }
-            $this->cost(array_fill_keys(self::BUCKETS, 1), $pricing['rates'] ?? []);
-            if (($pricing['currency'] ?? null) !== 'usd' || ($pricing['unit'] ?? null) !== 'per_1m_tokens') {
-                throw new UnexpectedValueException('Unsupported pricing currency or unit.');
-            }
+        return Cache::remember('pixelforge.pricing', 60, fn (): array => $this->fresh());
+    }
 
-            return $pricing;
-        });
+    public function fresh(): array
+    {
+        $pricing = $this->pixelforgeClient->pricing();
+        if (! is_array($pricing['rates'] ?? null)) {
+            throw new UnexpectedValueException('Invalid pricing rates.');
+        }
+        $this->cost(array_fill_keys(self::BUCKETS, 1), $pricing['rates']);
+        if (($pricing['currency'] ?? null) !== 'usd' || ($pricing['unit'] ?? null) !== 'per_1m_tokens') {
+            throw new UnexpectedValueException('Unsupported pricing currency or unit.');
+        }
+
+        return $pricing;
     }
 
     // Rates allow up to 9 decimals; /1M then ×1.25 needs at most 17. No floats or cent rounding.
@@ -71,7 +74,7 @@ class Pricing
         $usage['input_text_tokens'] = (int) bcadd(bcmul((string) $text, bcadd('1', $variance, 9), 9), '0.999999999', 0);
         $usage['reasoning_tokens'] = (int) $range['max'];
 
-        return ['typical' => $typical, 'min' => $minimum, 'max' => $this->cost($usage, $pricing['rates'])['user'], 'rates' => $pricing['rates']];
+        return ['typical' => $typical, 'min' => $minimum, 'max' => $this->cost($usage, $pricing['rates'])['user'], 'rates' => $pricing['rates'], 'max_tokens' => $usage];
     }
 
     private function validateEstimateTokens(array $pricing, string $quality, string $size): void

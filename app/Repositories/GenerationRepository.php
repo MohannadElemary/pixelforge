@@ -25,19 +25,15 @@ class GenerationRepository
             ->first();
     }
 
-    public function createRequest(int $userId, string $requestId, array $input, array $estimate): Generation
+    public function createRequest(int $userId, string $requestId, array $input, array $estimate, ?string $keyFingerprint): Generation
     {
-        // Autocommit lets a concurrent unique-key fallback see the committed winner on MySQL.
-        return Generation::firstOrCreate([
-            'user_id' => $userId,
-            'request_id' => $requestId,
-        ], [
-            'prompt' => $input['prompt'],
-            'size' => $input['size'],
-            'quality' => $input['quality'],
-            'reference_images' => $input['reference_images'],
-            'estimate' => $estimate,
-            'next_attempt_at' => now(),
+        // Admission holds the user lock and reserves funds in this same transaction.
+        return Generation::create([
+            'user_id' => $userId, 'request_id' => $requestId,
+            'prompt' => $input['prompt'], 'size' => $input['size'], 'quality' => $input['quality'],
+            'reference_images' => $input['reference_images'], 'estimate' => $estimate,
+            'reserved_cost' => $estimate['max'], 'reservation_tokens' => $estimate['max_tokens'],
+            'provider_key_fingerprint' => $keyFingerprint, 'next_attempt_at' => now(),
         ]);
     }
 

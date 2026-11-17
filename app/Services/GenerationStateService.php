@@ -8,12 +8,13 @@ use App\Repositories\WebhookEventRepository;
 use Illuminate\Support\Facades\DB;
 use UnexpectedValueException;
 
-class GenerationState
+class GenerationStateService
 {
     public function __construct(
-        private readonly Pricing $pricing,
-        private readonly GenerationRepository $generations,
-        private readonly WebhookEventRepository $events,
+        private readonly PricingService $pricingService,
+        private readonly GenerationRepository $generationRepository,
+        private readonly WebhookEventRepository $webhookEventRepository,
+        private readonly WalletService $walletService,
     ) {}
 
     public function apply(array $data, ?string $localId = null): bool
@@ -28,7 +29,7 @@ class GenerationState
             }
 
             $localId ??= $data['metadata']['generation_id'] ?? null;
-            $generation = $this->generations->findProviderForUpdate($providerId, $localId);
+            $generation = $this->generationRepository->findProviderForUpdate($providerId, $localId);
 
             if ($generation === null) {
                 return false;
@@ -58,8 +59,13 @@ class GenerationState
                 $generation->status = $status;
             }
 
+            if (! $generation->terminal() && $generation->reserved_cost !== null && is_array($generation->rates)) {
+                $bound = $this->pricingService->cost($generation->reservation_tokens, $generation->rates)['user'];
+                $this->walletService->resizeReservation($generation, $bound, accepted: true);
+            }
+
             if ($status === 'succeeded') {
-                $cost = $this->pricing->cost($data['usage'] ?? [], $data['rates'] ?? []);
+                $cost = $this->pricingService->cost($data['usage'] ?? [], $data['rates'] ?? []);
                 $generation->fill([
                     'usage' => $data['usage'],
                     'provider_cost' => $cost['provider'],
@@ -69,8 +75,8 @@ class GenerationState
                 ]);
             } elseif ($status === 'failed') {
                 $generation->fill([
-                    'provider_cost' => Pricing::ZERO,
-                    'actual_cost' => Pricing::ZERO,
+                    'provider_cost' => PricingService::ZERO,
+                    'actual_cost' => PricingService::ZERO,
                     'message' => $data['error']['message'] ?? 'The image could not be generated. You were not charged.',
                 ]);
             }
@@ -78,9 +84,10 @@ class GenerationState
             if ($generation->terminal()) {
                 $generation->completed_at = $data['completed_at'] ?? now();
                 $generation->next_attempt_at = null;
+                $this->walletService->settle($generation, $generation->actual_cost);
             }
 
-            $this->generations->save($generation);
+            $this->generationRepository->save($generation);
 
             return true;
         }, 5);
@@ -89,12 +96,12 @@ class GenerationState
     public function webhook(array $event): void
     {
         DB::transaction(function () use ($event): void {
-            if (! $this->events->record($event)) {
+            if (! $this->webhookEventRepository->record($event)) {
                 return;
             }
 
             if ($event['type'] === 'ping' || $this->apply($event['data']['object'])) {
-                $this->events->markProcessed($event['id']);
+                $this->webhookEventRepository->markProcessed($event['id']);
             }
         }, 5);
     }
@@ -105,11 +112,11 @@ class GenerationState
             return;
         }
 
-        foreach ($this->events->pendingForProvider($generation->provider_id) as $event) {
+        foreach ($this->webhookEventRepository->pendingForProvider($generation->provider_id) as $event) {
             DB::transaction(function () use ($event, $generation): void {
                 $payload = json_decode($event->payload, true, flags: JSON_THROW_ON_ERROR);
                 $this->apply($payload['data']['object'], $generation->id);
-                $this->events->markProcessed($event->id);
+                $this->webhookEventRepository->markProcessed($event->id);
             }, 5);
         }
     }

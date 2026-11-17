@@ -15,6 +15,21 @@ class PixelforgeClient
         return filled(config('services.pixelforge.key'));
     }
 
+    public function keyFingerprint(): ?string
+    {
+        return $this->configured() ? hash('sha256', config('services.pixelforge.key')) : null;
+    }
+
+    public function usage(string $startDate, string $endDate): array
+    {
+        $data = $this->authenticated()->timeout(8)->get('/usage', ['start_date' => $startDate, 'end_date' => $endDate])->throw()->json();
+        if (! is_array($data)) {
+            throw new UnexpectedValueException('Invalid usage response.');
+        }
+
+        return $data;
+    }
+
     public function pricing(): array
     {
         $data = Http::baseUrl(config('services.pixelforge.url'))

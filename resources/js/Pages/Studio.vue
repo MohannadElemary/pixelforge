@@ -1,9 +1,18 @@
 <script setup>
-import { computed, onMounted, onUnmounted, ref, watch } from 'vue';
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue';
 import { Head, Link, router, useForm, usePage } from '@inertiajs/vue3';
 import axios from 'axios';
-const props = defineProps({ generations: Object, configured: Boolean });
-const user = usePage().props.user;
+import AppHeader from '../Components/AppHeader.vue';
+import { compareMoney, money } from '../lib/money';
+const props = defineProps({ generations: Object, configured: Boolean, creditOptions: Array });
+const page = usePage();
+const wallet = computed(() => page.props.wallet);
+const creditsOpen = ref(false);
+const purchase = useForm({
+    amount: props.creditOptions?.[0]?.amount || '',
+    request_id: crypto.randomUUID(),
+});
+const purchaseSuccess = ref('');
 const form = useForm({
     prompt: '',
     size: '1024x1024',
@@ -38,11 +47,6 @@ const input = computed(() => ({
     quality: form.quality,
     reference_images: references.value,
 }));
-const money = (value) => {
-    if (value === null || value === undefined) return '—';
-    const [whole, decimals = ''] = String(value).split('.');
-    return '$' + whole + '.' + decimals.replace(/0+$/, '').padEnd(4, '0');
-};
 const date = (value) =>
     new Intl.DateTimeFormat(undefined, {
         month: 'short',
@@ -51,9 +55,15 @@ const date = (value) =>
         minute: '2-digit',
     }).format(new Date(value));
 const safeUrl = (url) => (/^https?:\/\//i.test(url || '') ? url : null);
-const hasPending = computed(() =>
-    props.generations.data.some((g) => !['succeeded', 'failed'].includes(g.status)),
+const hasPending = computed(
+    () =>
+        compareMoney(wallet.value?.reserved, '0') === 1 ||
+        props.generations.data.some((g) => !['succeeded', 'failed'].includes(g.status)),
 );
+const canAfford = computed(() => {
+    const comparison = compareMoney(wallet.value?.available, estimate.value?.reservation);
+    return comparison !== null && comparison >= 0;
+});
 watch(
     input,
     () => {
@@ -86,7 +96,7 @@ watch(
     { deep: true },
 );
 function submit() {
-    if (!estimate.value || !props.configured || form.processing) return;
+    if (!estimate.value || !canAfford.value || !props.configured || form.processing) return;
     form.reference_images = references.value;
     form.post('/generations', {
         preserveScroll: true,
@@ -97,10 +107,28 @@ function submit() {
         },
     });
 }
+function buyCredits() {
+    if (purchase.processing) return;
+    purchaseSuccess.value = '';
+    purchase.post('/credits/purchases', {
+        preserveScroll: true,
+        onSuccess: () => {
+            purchase.request_id = crypto.randomUUID();
+            purchaseSuccess.value =
+                page.props.flash?.success || 'Simulated credits added to your balance.';
+        },
+    });
+}
+async function openCredits() {
+    creditsOpen.value = true;
+    await nextTick();
+    document.querySelector('#purchase-credits input')?.focus({ preventScroll: true });
+    document.getElementById('credits')?.scrollIntoView({ block: 'center' });
+}
 onMounted(() => {
     poll = setInterval(() => {
         if (hasPending.value && document.visibilityState === 'visible')
-            router.reload({ only: ['generations'] });
+            router.reload({ only: ['generations', 'wallet'] });
     }, 5000);
 });
 onUnmounted(() => {
@@ -113,17 +141,7 @@ onUnmounted(() => {
 <template>
     <Head title="Studio" />
     <div class="studio-page">
-        <header class="topbar">
-            <Link href="/studio" class="brand"
-                ><span class="brand-mark">✳</span> pixelforge<span class="brand-dot">.</span></Link
-            >
-            <span class="topbar-label">YOUR CREATIVE STUDIO</span>
-            <div class="account">
-                <span class="avatar">{{ user.name.slice(0, 1).toUpperCase() }}</span
-                ><span class="account-name">{{ user.name }}</span
-                ><Link href="/logout" method="post" as="button" class="signout">Sign out</Link>
-            </div>
-        </header>
+        <AppHeader />
         <main class="studio-main">
             <div class="page-heading">
                 <div>
@@ -132,6 +150,85 @@ onUnmounted(() => {
                 </div>
                 <span class="workspace-tag"><i></i> Personal workspace</span>
             </div>
+            <section id="credits" class="wallet-panel" aria-label="Your credits">
+                <div class="wallet-overview">
+                    <dl class="wallet-amounts">
+                        <div>
+                            <dt>Available credits</dt>
+                            <dd>{{ money(wallet?.available) }}</dd>
+                        </div>
+                        <div>
+                            <dt>Total balance</dt>
+                            <dd>{{ money(wallet?.balance) }}</dd>
+                        </div>
+                        <div>
+                            <dt>Reserved for images</dt>
+                            <dd>{{ money(wallet?.reserved) }}</dd>
+                        </div>
+                    </dl>
+                    <button
+                        class="secondary-button"
+                        type="button"
+                        :aria-expanded="creditsOpen"
+                        aria-controls="purchase-credits"
+                        @click="creditsOpen = !creditsOpen"
+                    >
+                        Buy credits <span aria-hidden="true">{{ creditsOpen ? '−' : '+' }}</span>
+                    </button>
+                </div>
+                <p class="wallet-note">
+                    Reserved credits are held while images finish. Only successful images are
+                    charged.
+                </p>
+                <form
+                    v-if="creditsOpen"
+                    id="purchase-credits"
+                    class="purchase-form"
+                    @submit.prevent="buyCredits"
+                >
+                    <div class="purchase-intro">
+                        <h2>Make room for more ideas.</h2>
+                        <p>Simulated purchase. No real payment is taken.</p>
+                    </div>
+                    <fieldset :disabled="purchase.processing">
+                        <legend>Choose an amount in USD</legend>
+                        <div class="credit-options">
+                            <label
+                                v-for="option in creditOptions"
+                                :key="option.amount"
+                                :class="{ selected: purchase.amount === option.amount }"
+                            >
+                                <input
+                                    v-model="purchase.amount"
+                                    type="radio"
+                                    name="credit-amount"
+                                    :value="option.amount"
+                                    required
+                                />
+                                {{ option.label }}
+                            </label>
+                        </div>
+                    </fieldset>
+                    <button
+                        class="button primary purchase-button"
+                        :disabled="purchase.processing || !purchase.amount"
+                    >
+                        {{ purchase.processing ? 'Adding credits…' : 'Add simulated credits'
+                        }}<span aria-hidden="true">↗</span>
+                    </button>
+                    <p
+                        v-for="(error, key) in purchase.errors"
+                        :key="key"
+                        class="field-error"
+                        role="alert"
+                    >
+                        {{ error }}
+                    </p>
+                </form>
+                <p v-if="purchaseSuccess" class="success-notice" role="status">
+                    {{ purchaseSuccess }}
+                </p>
+            </section>
             <div class="workspace">
                 <aside class="create-panel">
                     <div class="panel-heading">
@@ -246,18 +343,32 @@ onUnmounted(() => {
                             <p v-if="estimate" class="estimate-range">
                                 Expected range {{ money(estimate.min) }}–{{ money(estimate.max) }}
                             </p>
+                            <p v-if="estimate" class="estimate-range">
+                                Credits reserved {{ money(estimate.reservation) }}
+                            </p>
                             <p v-else-if="estimateError" class="field-error">{{ estimateError }}</p>
                             <p v-else-if="!estimating" class="hint">
                                 Add a prompt to see your live estimate.
                             </p>
                             <p class="estimate-note">
-                                Includes 25% markup. Final cost follows actual token use. Failed
-                                images are free.
+                                Includes 25% markup. We reserve the maximum estimate, then charge
+                                actual token use. Unused credits return to your available balance.
+                                Failed images are free.
                             </p>
+                            <div
+                                v-if="estimate && !canAfford"
+                                class="insufficient-credits"
+                                role="status"
+                            >
+                                <p>You need enough available credits to cover this reservation.</p>
+                                <button type="button" class="text-button" @click="openCredits">
+                                    Buy credits ↗
+                                </button>
+                            </div>
                         </div>
                         <button
                             class="button primary generate-button"
-                            :disabled="!configured || !estimate || form.processing"
+                            :disabled="!configured || !estimate || !canAfford || form.processing"
                         >
                             {{ form.processing ? 'Adding to your studio…' : 'Generate image'
                             }}<span aria-hidden="true">↗</span>
@@ -385,6 +496,17 @@ onUnmounted(() => {
                                 </div>
                                 <p v-if="generation.message" class="generation-message">
                                     {{ generation.message }}
+                                </p>
+                                <p
+                                    v-if="
+                                        generation.reserved_cost &&
+                                        !generation.wallet_settled_at &&
+                                        !['succeeded', 'failed'].includes(generation.status)
+                                    "
+                                    class="generation-message"
+                                >
+                                    {{ money(generation.reserved_cost) }} reserved until this image
+                                    finishes.
                                 </p>
                                 <Link
                                     v-if="generation.needs_attention"

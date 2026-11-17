@@ -13,6 +13,12 @@ class User extends Authenticatable
     /** @use HasFactory<UserFactory> */
     use HasFactory, Notifiable;
 
+    protected $attributes = [
+        'credit_balance' => '0.000000000000000000',
+        'credit_reserved' => '0.000000000000000000',
+        'is_admin' => false,
+    ];
+
     /**
      * The attributes that are mass assignable.
      *
@@ -44,6 +50,7 @@ class User extends Authenticatable
         return [
             'email_verified_at' => 'datetime',
             'password' => 'hashed',
+            'is_admin' => 'boolean',
         ];
     }
 }

@@ -4,9 +4,10 @@ namespace Tests\Feature;
 
 use App\Models\Generation;
 use App\Models\User;
-use App\Services\GenerationState;
-use App\Services\GenerationWorker;
-use App\Services\Pricing;
+use App\Services\GenerationStateService;
+use App\Services\GenerationWorkerService;
+use App\Services\PricingService;
+use App\Services\WalletService;
 use Illuminate\Cache\RateLimiter;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Http\Client\ConnectionException;
@@ -60,11 +61,11 @@ class GenerationTest extends TestCase
 
     public function test_exact_provider_cost_markup_and_fractional_nanodollars(): void
     {
-        $pricing = app(Pricing::class);
-        $result = $pricing->cost(['input_text_tokens' => 115, 'input_image_tokens' => 1530, 'output_tokens' => 6450, 'reasoning_tokens' => 8000], $this->rates);
+        $pricingService = app(PricingService::class);
+        $result = $pricingService->cost(['input_text_tokens' => 115, 'input_image_tokens' => 1530, 'output_tokens' => 6450, 'reasoning_tokens' => 8000], $this->rates);
         $this->assertSame('0.373875000000000000', $result['provider']);
         $this->assertSame('0.467343750000000000', $result['user']);
-        $fraction = $pricing->cost(['input_text_tokens' => 1, 'input_image_tokens' => 0, 'output_tokens' => 0, 'reasoning_tokens' => 0], array_fill_keys(Pricing::BUCKETS, '0.000000001'));
+        $fraction = $pricingService->cost(['input_text_tokens' => 1, 'input_image_tokens' => 0, 'output_tokens' => 0, 'reasoning_tokens' => 0], array_fill_keys(PricingService::BUCKETS, '0.000000001'));
         $this->assertSame('0.000000000000001250', $fraction['user']);
     }
 
@@ -73,7 +74,7 @@ class GenerationTest extends TestCase
         $pricing = $this->pricing();
         $pricing['rates']['output_tokens'] = '80.00';
         Http::fake(['*/pricing' => Http::response($pricing)]);
-        $estimate = app(Pricing::class)->estimate(['prompt' => str_repeat('森', 400), 'size' => '1536x1024', 'quality' => 'high', 'reference_images' => ['https://example.com/1', 'https://example.com/2']]);
+        $estimate = app(PricingService::class)->estimate(['prompt' => str_repeat('森', 400), 'size' => '1536x1024', 'quality' => 'high', 'reference_images' => ['https://example.com/1', 'https://example.com/2']]);
         $this->assertSame('0.789843750000000000', $estimate['max']);
         $this->assertSame('80.00', $estimate['rates']['output_tokens']);
     }
@@ -99,7 +100,7 @@ class GenerationTest extends TestCase
         $this->webhook($event)->assertNoContent();
         $this->webhook($event)->assertNoContent();
         $this->webhook(['id' => 'evt_processing', 'type' => 'generation.processing', 'data' => ['object' => $this->object($generation, 'processing')]])->assertNoContent();
-        app(GenerationState::class)->apply($this->object($generation, 'queued'), $generation->id);
+        app(GenerationStateService::class)->apply($this->object($generation, 'queued'), $generation->id);
         $generation->refresh();
         $this->assertSame('succeeded', $generation->status);
         $this->assertSame('0.563510000000000000', $generation->provider_cost);
@@ -110,9 +111,9 @@ class GenerationTest extends TestCase
     public function test_failed_generations_are_free_and_final(): void
     {
         $generation = $this->generation();
-        $state = app(GenerationState::class);
-        $state->apply($this->object($generation, 'failed'));
-        $state->apply($this->object($generation, 'succeeded'));
+        $generationStateService = app(GenerationStateService::class);
+        $generationStateService->apply($this->object($generation, 'failed'));
+        $generationStateService->apply($this->object($generation, 'succeeded'));
         $this->assertSame('failed', $generation->fresh()->status);
         $this->assertSame('0.000000000000000000', $generation->fresh()->actual_cost);
     }
@@ -135,7 +136,7 @@ class GenerationTest extends TestCase
 
             return Http::response($this->object($generation, 'queued'), 202);
         });
-        app(GenerationWorker::class)->tick();
+        app(GenerationWorkerService::class)->tick();
         $this->assertSame('succeeded', $generation->fresh()->status);
         $this->assertSame('0.381887500000000000', $generation->fresh()->actual_cost);
     }
@@ -152,16 +153,16 @@ class GenerationTest extends TestCase
 
             return Http::response($this->object($generation, count($sent) === 2 ? 'queued' : 'succeeded'), 202);
         });
-        $worker = app(GenerationWorker::class);
-        $worker->tick();
+        $generationWorkerService = app(GenerationWorkerService::class);
+        $generationWorkerService->tick();
         $this->assertTrue($generation->fresh()->uncertain);
         $this->assertNull($generation->fresh()->actual_cost);
         $this->travel(3)->seconds();
-        $worker->tick();
+        $generationWorkerService->tick();
         $this->assertSame($sent[0], $sent[1]);
         $this->assertSame([$generation->id], $sent[0]['key']);
         $this->travel(9)->seconds();
-        $worker->tick();
+        $generationWorkerService->tick();
         $this->assertSame('GET', $sent[2]['method']);
         $this->assertSame('succeeded', $generation->fresh()->status);
     }
@@ -170,13 +171,13 @@ class GenerationTest extends TestCase
     {
         $generation = $this->generation();
         Http::fake(['*' => Http::response(['error' => ['code' => 'concurrency_limit_exceeded']], 429, ['Retry-After' => '45'])]);
-        $worker = app(GenerationWorker::class);
-        $worker->tick();
+        $generationWorkerService = app(GenerationWorkerService::class);
+        $generationWorkerService->tick();
         $this->assertGreaterThanOrEqual(44, now()->diffInSeconds($generation->fresh()->next_attempt_at));
-        $this->assertFalse($worker->tick());
+        $this->assertFalse($generationWorkerService->tick());
         for ($i = 0; $i < 4; $i++) {
             $this->travel(46)->seconds();
-            $worker->tick();
+            $generationWorkerService->tick();
         }
         $this->assertSame('failed', $generation->fresh()->status);
         $this->assertSame('0.000000000000000000', $generation->fresh()->actual_cost);
@@ -195,12 +196,12 @@ class GenerationTest extends TestCase
 
             return Http::response(['data' => [$this->object($generation)], 'has_more' => false]);
         });
-        $worker = app(GenerationWorker::class);
-        $worker->tick();
+        $generationWorkerService = app(GenerationWorkerService::class);
+        $generationWorkerService->tick();
         $this->assertTrue($generation->fresh()->reconciling);
         $this->assertNull($generation->fresh()->actual_cost);
         $this->travel(33)->seconds();
-        $worker->tick();
+        $generationWorkerService->tick();
         $this->assertSame('succeeded', $generation->fresh()->status);
         $this->assertSame(2, $requests);
     }
@@ -209,6 +210,7 @@ class GenerationTest extends TestCase
     {
         Http::fake(['*/pricing' => Http::response($this->pricing())]);
         $user = User::factory()->create();
+        app(WalletService::class)->purchase($user->id, (string) Str::uuid(), '5.00');
         $input = ['prompt' => 'Test forest', 'size' => '1024x1024', 'quality' => 'medium', 'reference_images' => [], 'request_id' => (string) Str::uuid()];
         $this->actingAs($user)->post('/generations', $input)->assertRedirect('/studio');
         $this->post('/generations', $input)->assertRedirect('/studio');
@@ -234,15 +236,15 @@ class GenerationTest extends TestCase
     {
         Http::fake(['*' => Http::response(['error' => ['code' => 'daily_limit_exceeded']], 429)]);
         $known = $this->generation();
-        $worker = app(GenerationWorker::class);
-        $worker->tick();
+        $generationWorkerService = app(GenerationWorkerService::class);
+        $generationWorkerService->tick();
         $known->refresh();
         $this->assertSame('failed', $known->status);
         $this->assertSame('0.000000000000000000', $known->actual_cost);
         $this->assertStringContainsString('daily generation limit', $known->message);
         $this->assertSame(1, $known->attempts);
         $ambiguous = $this->generation(['uncertain' => true]);
-        $worker->tick();
+        $generationWorkerService->tick();
         $this->assertNull($ambiguous->fresh()->actual_cost);
         $this->assertSame('queued', $ambiguous->fresh()->status);
         $this->assertTrue($ambiguous->fresh()->needs_attention);
@@ -257,15 +259,15 @@ class GenerationTest extends TestCase
         }
         $waiting = $this->generation(['attempts' => 2]);
         Http::fake(['*' => Http::response($this->object($waiting, 'queued'), 202)]);
-        $worker = app(GenerationWorker::class);
-        $this->assertFalse($worker->tick());
+        $generationWorkerService = app(GenerationWorkerService::class);
+        $this->assertFalse($generationWorkerService->tick());
         $this->assertSame(2, $waiting->fresh()->attempts);
         $this->assertSame('queued', $waiting->fresh()->status);
         Http::assertNothingSent();
         $completed = $this->object($active[0]);
         $completed['id'] = $active[0]->provider_id;
-        app(GenerationState::class)->apply($completed);
-        $this->assertTrue($worker->tick());
+        app(GenerationStateService::class)->apply($completed);
+        $this->assertTrue($generationWorkerService->tick());
         $this->assertNotNull($waiting->fresh()->provider_id);
         Http::assertSentCount(1);
     }
@@ -278,7 +280,7 @@ class GenerationTest extends TestCase
         }
         $waiting = $this->generation();
         Http::fake(['*' => Http::response($this->object($waiting, 'queued'), 202)]);
-        $this->assertTrue(app(GenerationWorker::class)->tick());
+        $this->assertTrue(app(GenerationWorkerService::class)->tick());
         $this->assertNotNull($waiting->fresh()->provider_id);
         Http::assertSentCount(1);
         foreach ($paused as $generation) {
@@ -296,6 +298,7 @@ class GenerationTest extends TestCase
     public function test_generation_requests_validate_options_and_ignore_forged_ownership_and_billing(): void
     {
         $user = User::factory()->create();
+        app(WalletService::class)->purchase($user->id, (string) Str::uuid(), '5.00');
         $other = User::factory()->create();
         $this->actingAs($user)->postJson('/generations', [
             'prompt' => str_repeat('x', 4001), 'size' => 'tiny', 'quality' => 'invalid',

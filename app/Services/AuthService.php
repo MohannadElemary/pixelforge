@@ -8,11 +8,11 @@ use Illuminate\Support\Facades\Auth;
 
 class AuthService
 {
-    public function __construct(private readonly UserRepository $users) {}
+    public function __construct(private readonly UserRepository $userRepository) {}
 
     public function register(array $input): void
     {
-        Auth::login($this->users->create($input));
+        Auth::login($this->userRepository->create($input));
     }
 
     public function login(array $input): void

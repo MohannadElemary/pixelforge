@@ -1,6 +1,8 @@
 <?php
 
+use App\Http\Controllers\AdminReportController;
 use App\Http\Controllers\AuthController;
+use App\Http\Controllers\CreditPurchaseController;
 use App\Http\Controllers\StudioController;
 use Illuminate\Support\Facades\Route;
 
@@ -13,6 +15,8 @@ Route::middleware('guest')->group(function () {
 });
 Route::middleware('auth')->group(function () {
     Route::post('/logout', [AuthController::class, 'logout']);
+    Route::get('/admin/reports', [AdminReportController::class, 'index'])->middleware('throttle:10,1')->name('admin.reports');
+    Route::post('/credits/purchases', [CreditPurchaseController::class, 'store'])->middleware('throttle:12,1');
     Route::get('/studio', [StudioController::class, 'index']);
     Route::post('/estimate', [StudioController::class, 'estimate'])->middleware('throttle:60,1');
     Route::post('/generations', [StudioController::class, 'store'])->middleware('throttle:12,1');

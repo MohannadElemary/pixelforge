@@ -3,24 +3,28 @@
 namespace App\Services;
 
 use App\Clients\PixelforgeClient;
+use App\Exceptions\WalletException;
 use App\Models\Generation;
 use App\Repositories\GenerationRepository;
 use Illuminate\Http\Client\ConnectionException;
 use Illuminate\Http\Client\Response;
 use Illuminate\Support\Facades\DB;
+use Throwable;
 use TypeError;
 use UnexpectedValueException;
 
-class GenerationWorker
+class GenerationWorkerService
 {
     private const MAX_ATTEMPTS = 5;
 
     private const CONCURRENCY_LIMIT = 3;
 
     public function __construct(
-        private readonly GenerationState $state,
-        private readonly GenerationRepository $generations,
-        private readonly PixelforgeClient $provider,
+        private readonly GenerationStateService $generationStateService,
+        private readonly GenerationRepository $generationRepository,
+        private readonly PixelforgeClient $pixelforgeClient,
+        private readonly PricingService $pricingService,
+        private readonly WalletService $walletService,
     ) {}
 
     public function tick(): bool
@@ -31,7 +35,7 @@ class GenerationWorker
             return false;
         }
 
-        if (! $this->provider->configured()) {
+        if (! $this->pixelforgeClient->configured()) {
             $this->update($generation, [
                 'needs_attention' => true,
                 'message' => 'Generation is paused while the service connection is configured.',
@@ -46,15 +50,43 @@ class GenerationWorker
             return true;
         }
 
+        if (($generation->uncertain || $generation->provider_id !== null || $generation->reconciling) && $generation->provider_key_fingerprint !== null
+            && $generation->provider_key_fingerprint !== $this->pixelforgeClient->keyFingerprint()) {
+            $this->update($generation, [
+                'needs_attention' => true,
+                'message' => 'This request is awaiting confirmation with its original provider connection. Its credit hold is retained.',
+            ]);
+
+            return true;
+        }
+
+        if (! $generation->provider_id && ! $generation->uncertain && ! $generation->reconciling && $generation->reserved_cost !== null) {
+            // Pricing I/O happens before submission: its failure cannot imply an accepted image.
+            try {
+                $estimate = $this->pricingService->estimate([
+                    'prompt' => $generation->prompt, 'size' => $generation->size,
+                    'quality' => $generation->quality, 'reference_images' => $generation->reference_images,
+                ], $this->pricingService->fresh());
+            } catch (Throwable $exception) {
+                report($exception);
+                $this->retry($generation, 'Current prices are unavailable. Checking again before ordering your image.', false);
+
+                return true;
+            }
+            if (! $this->prepareReservation($generation, $estimate)) {
+                return true;
+            }
+        }
+
         try {
             if ($generation->reconciling) {
-                $response = $this->provider->list($generation->reconcile_cursor);
+                $response = $this->pixelforgeClient->list($generation->reconcile_cursor);
             } elseif ($generation->provider_id) {
-                $response = $this->provider->retrieve($generation->provider_id);
+                $response = $this->pixelforgeClient->retrieve($generation->provider_id);
             } else {
                 // Persist uncertainty without changing the claim's previous outcome knowledge.
                 $this->update($generation, ['uncertain' => true]);
-                $response = $this->provider->submit($generation);
+                $response = $this->pixelforgeClient->submit($generation);
             }
 
             if (! $response->successful()) {
@@ -62,8 +94,8 @@ class GenerationWorker
             } elseif ($generation->reconciling) {
                 $this->reconcile($generation, $response->json());
             } else {
-                $this->state->apply($response->json(), $generation->id);
-                $this->state->pendingEvents($this->generations->find($generation->id));
+                $this->generationStateService->apply($response->json(), $generation->id);
+                $this->generationStateService->pendingEvents($this->generationRepository->find($generation->id));
             }
         } catch (ConnectionException) {
             $this->retry($generation, 'The provider is taking longer to respond. Checking safely for your image.', true);
@@ -75,15 +107,43 @@ class GenerationWorker
         return true;
     }
 
+    private function prepareReservation(Generation $generation, array $estimate): bool
+    {
+        return DB::transaction(function () use ($generation, $estimate): bool {
+            $current = $this->generationRepository->findForUpdate($generation->id);
+            if ($current->terminal() || $current->provider_id !== null) {
+                return false;
+            }
+            try {
+                $this->walletService->resizeReservation($current, $estimate['max']);
+            } catch (WalletException) {
+                $this->walletService->settle($current, PricingService::ZERO);
+                $this->generationRepository->save($current, [
+                    'status' => 'failed', 'provider_cost' => PricingService::ZERO, 'actual_cost' => PricingService::ZERO,
+                    'completed_at' => now(), 'next_attempt_at' => null,
+                    'message' => 'Prices changed and your available credits no longer cover this image. You were not charged.',
+                ]);
+
+                return false;
+            }
+            $this->generationRepository->save($current, [
+                'reservation_tokens' => $estimate['max_tokens'],
+                'provider_key_fingerprint' => $this->pixelforgeClient->keyFingerprint(),
+            ]);
+
+            return true;
+        }, 5);
+    }
+
     private function claim(): ?Generation
     {
         return DB::transaction(function (): ?Generation {
-            $capacityFull = $this->generations->capacityIsFull(self::CONCURRENCY_LIMIT);
-            $generation = $this->generations->nextDueForUpdate($capacityFull);
+            $capacityFull = $this->generationRepository->capacityIsFull(self::CONCURRENCY_LIMIT);
+            $generation = $this->generationRepository->nextDueForUpdate($capacityFull);
 
             if ($generation !== null) {
                 // Persist the attempt before I/O; an interrupted process still consumes an attempt.
-                $this->generations->save($generation, [
+                $this->generationRepository->save($generation, [
                     'attempts' => $generation->attempts + 1,
                     'next_attempt_at' => now()->addSeconds(60),
                 ]);
@@ -117,8 +177,8 @@ class GenerationWorker
         } elseif (! $generation->provider_id && ! $generation->reconciling && ! $uncertain) {
             $this->update($generation, [
                 'status' => 'failed',
-                'provider_cost' => Pricing::ZERO,
-                'actual_cost' => Pricing::ZERO,
+                'provider_cost' => PricingService::ZERO,
+                'actual_cost' => PricingService::ZERO,
                 'uncertain' => false,
                 'completed_at' => now(),
                 'next_attempt_at' => null,
@@ -158,8 +218,8 @@ class GenerationWorker
             } elseif (! $generation->provider_id && ! $uncertain) {
                 $updates += [
                     'status' => 'failed',
-                    'provider_cost' => Pricing::ZERO,
-                    'actual_cost' => Pricing::ZERO,
+                    'provider_cost' => PricingService::ZERO,
+                    'actual_cost' => PricingService::ZERO,
                     'completed_at' => now(),
                 ];
                 $updates['next_attempt_at'] = null;
@@ -181,8 +241,8 @@ class GenerationWorker
 
         foreach ($response['data'] as $data) {
             if (($data['metadata']['generation_id'] ?? null) === $generation->id) {
-                $this->state->apply($data, $generation->id);
-                $this->state->pendingEvents($this->generations->find($generation->id));
+                $this->generationStateService->apply($data, $generation->id);
+                $this->generationStateService->pendingEvents($this->generationRepository->find($generation->id));
 
                 return;
             }
@@ -206,7 +266,7 @@ class GenerationWorker
     private function update(Generation $generation, array $values): void
     {
         DB::transaction(function () use ($generation, $values): void {
-            $current = $this->generations->findForUpdate($generation->id);
+            $current = $this->generationRepository->findForUpdate($generation->id);
 
             if ($current->terminal()) {
                 return;
@@ -217,7 +277,11 @@ class GenerationWorker
                 return;
             }
 
-            $this->generations->save($current, $values);
+            $current->fill($values);
+            if ($current->status === 'failed') {
+                $this->walletService->settle($current, PricingService::ZERO);
+            }
+            $this->generationRepository->save($current);
         }, 5);
     }
 }

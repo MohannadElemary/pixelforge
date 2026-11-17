@@ -14,7 +14,7 @@ use Inertia\Response;
 
 class AuthController extends Controller
 {
-    public function __construct(private readonly AuthService $auth) {}
+    public function __construct(private readonly AuthService $authService) {}
 
     public function show(Request $request): Response
     {
@@ -25,7 +25,7 @@ class AuthController extends Controller
 
     public function register(RegisterRequest $request): RedirectResponse
     {
-        $this->auth->register($request->validated());
+        $this->authService->register($request->validated());
         $request->session()->regenerate();
 
         return redirect('/studio');
@@ -34,7 +34,7 @@ class AuthController extends Controller
     public function login(LoginRequest $request): RedirectResponse
     {
         try {
-            $this->auth->login($request->validated());
+            $this->authService->login($request->validated());
         } catch (InvalidCredentialsException $exception) {
             throw ValidationException::withMessages(['email' => $exception->getMessage()]);
         }
@@ -46,7 +46,7 @@ class AuthController extends Controller
 
     public function logout(Request $request): RedirectResponse
     {
-        $this->auth->logout();
+        $this->authService->logout();
         $request->session()->invalidate();
         $request->session()->regenerateToken();
         Inertia::clearHistory();

@@ -23,6 +23,8 @@ class GenerationResource extends JsonResource
             'usage' => $this->usage,
             'provider_cost' => $this->provider_cost,
             'actual_cost' => $this->actual_cost,
+            'reserved_cost' => $this->reserved_cost,
+            'wallet_settled_at' => $this->wallet_settled_at?->toISOString(),
             'image_url' => $this->imageUrl(),
             'image_url_expires_at' => $this->image_url_expires_at?->toISOString(),
             'message' => $this->message,

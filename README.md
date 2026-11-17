@@ -1,6 +1,6 @@
 # Pixelforge
 
-A Laravel 12, Vue 3 and Inertia image studio. Sign up, estimate an image, generate it and follow its status and exact cost in your collection.
+A Laravel 12, Vue 3 and Inertia image studio. Sign up, add simulated credits, estimate an image and follow its status and exact cost in your collection. Administrators can reconcile daily spending with provider usage.
 
 ## Run
 
@@ -32,7 +32,7 @@ Omit `--test` to apply PHP formatting; use `npm run format` to apply frontend fo
 
 ## Structure
 
-Form Requests validate inputs and authorize retries through `GenerationPolicy`; controllers only coordinate HTTP responses. `AuthService` and `GenerationService` handle account and request workflows. `GenerationState` owns atomic status/billing transitions and webhook deduplication; `GenerationWorker` owns submission and recovery decisions. Concrete user, generation and webhook repositories contain persistence queries and row locks, and `PixelforgeClient` contains provider HTTP calls. History resources expose an explicit, stable response shape without internal retry or correlation fields.
+Form Requests validate inputs and authorize retries through `GenerationPolicy`; controllers only coordinate HTTP responses. `AuthService` and `GenerationService` handle account and request workflows. `PricingService` calculates exact prices; `WalletService` owns reservations and settlement; `AdminReportService` aggregates daily accounting and reconciles provider usage. `GenerationStateService` owns atomic status/billing transitions and webhook deduplication; `GenerationWorkerService` owns submission and recovery decisions. Concrete domain repositories contain persistence queries and row locks, and `PixelforgeClient` contains provider HTTP calls. History resources expose an explicit, stable response shape without internal retry or correlation fields.
 
 Private Inertia history is encrypted and cleared on logout and guest authentication pages. Login attempts are limited by account/IP pair and by IP, so traffic from another IP cannot exhaust a user’s per-account allowance. Webhooks use a stateless route: signatures authenticate raw bytes before Form Request parsing. Query indexes support owner history, due work and pending events; capacity checks read at most three IDs and event recovery streams in batches.
 
@@ -43,7 +43,36 @@ Private Inertia history is encrypted and cleared on logout and guest authenticat
 - New submissions wait locally while three known provider generations are active, without consuming retry attempts. Daily quota rejections stop immediately. Submissions use at most five automatic attempts with exponential backoff and `Retry-After`. Lost replies remain unconfirmed, never falsely free failures. After exhausted ambiguous submissions, bounded provider-history pagination reconciles the metadata ID. A visible “Check again” action safely resumes with the original key. Poll failures also pause after five errors; webhook delivery can still finish them.
 - Webhook HMACs cover the raw body with a five-minute timestamp tolerance. Event IDs are unique; event insertion and state/billing updates commit together. The same monotonic updater handles webhooks, submission replies and polls. Terminal records cannot regress or be billed twice. Early events correlate through metadata; unmatched events remain stored for reconciliation.
 - Pricing is fetched publicly and cached for 60 seconds. Estimates use Unicode character counts and midpoint reasoning tokens, with an expected range. Final billing uses all four actual token buckets and the generation's frozen rates, plus exactly 25%. BCMath and decimal strings preserve 18 decimal places, including fractional nanodollars; displayed amounts are not rounded to cents. Failed requests cost zero. Unknown outcomes remain unpriced until confirmed.
-- Images use the provider's signed URLs and expire after 24 hours. No permanent image storage, balances or admin reporting are included.
+- Images use the provider's signed URLs and expire after 24 hours. No permanent image storage is included.
+
+## Credits and reports
+
+All accounts start with $0. The Studio offers simulated $5, $10 and $25 purchases, capped at a $1,000 balance; no payment is processed. Purchase UUIDs are unique per user, so retries credit once. New images reserve the maximum estimated cost under a user row lock; simultaneous requests cannot spend the same available funds. Terminal settlement locks the generation and then its user, debits the exact actual charge once, and releases the hold. Confirmed failures release it for free; uncertain or paused requests retain it. Existing pre-wallet generations remain exempt from wallet debits.
+
+The worker refreshes prices before a definite submission and cancels locally for free if the revised hold is unaffordable. Accepted generations use their frozen rates. The provider has no locked quote or spending cap: a price change during acceptance can exceed the hold. The actual cost is still recorded exactly; a resulting negative available balance blocks new images until credits are added.
+
+Grant access to an explicitly registered account (there is no automatic administrator):
+
+```sh
+docker compose -f compose.yaml -p pixelforge exec app php artisan pixelforge:admin person@example.com
+# Add --revoke to remove access. On Cloud, run the artisan command in its console.
+```
+
+`/admin/reports` groups successful generation charges, provider costs and profit by UTC completion day and user. Date ranges are limited to 92 inclusive days. The default view and provider comparison use the configured API key; the all-history view preserves older key cohorts. Purchases fund wallets and never count as generation spend or profit. Provider comparisons are fetched on request; unavailable comparisons leave the local report visible. Unattributed historical rows and differences from external activity remain explicit.
+
+Use separate provider keys per environment. New records store a SHA-256 fingerprint, never the key. Before rotating keys, drain pending requests and retain the old key's attribution for historical records; do not infer a legacy null fingerprint without verifying its origin. An ambiguous submission pauses if its original connection changes, retaining its hold.
+
+## Local diagnostics
+
+Telescope is a development dependency, registered only when `APP_ENV=local`. Docker uses that environment by default. Its migrations live in `database/migrations/local` and are loaded only with Telescope, so Cloud's production install creates no diagnostics tables or routes.
+
+After granting your local account admin access with `pixelforge:admin`, open http://localhost:8088/telescope. Authentication and admin access are required even locally. Passwords, API authorization, cookies, CSRF tokens and webhook signatures are redacted. The long-running image worker is excluded from recording because it has no per-job flush boundary. To clear entries older than 48 hours:
+
+```sh
+docker compose -f compose.yaml -p pixelforge exec app php artisan telescope:prune --hours=48
+```
+
+Keep `APP_ENV=production` and `composer install --no-dev` on Cloud. See the [Telescope local installation guide](https://laravel.com/framework/docs/telescope#local-only-installation).
 
 ## Laravel Cloud
 

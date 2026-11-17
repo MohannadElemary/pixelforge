@@ -2,7 +2,7 @@
 
 namespace App\Console\Commands;
 
-use App\Services\GenerationWorker;
+use App\Services\GenerationWorkerService;
 use Illuminate\Console\Command;
 
 class WorkGenerations extends Command
@@ -11,11 +11,11 @@ class WorkGenerations extends Command
 
     protected $description = 'Submit and reconcile durable image requests';
 
-    public function handle(GenerationWorker $worker): int
+    public function handle(GenerationWorkerService $generationWorkerService): int
     {
         do {
             try {
-                $worked = $worker->tick();
+                $worked = $generationWorkerService->tick();
             } catch (\Throwable $e) {
                 report($e);
                 $worked = false;
