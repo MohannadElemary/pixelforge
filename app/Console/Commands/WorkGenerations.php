@@ -8,6 +8,7 @@ use Illuminate\Console\Command;
 class WorkGenerations extends Command
 {
     protected $signature = 'pixelforge:work {--once : Process one due generation and exit}';
+
     protected $description = 'Submit and reconcile durable image requests';
 
     public function handle(GenerationWorker $worker): int
@@ -19,10 +20,13 @@ class WorkGenerations extends Command
                 report($e);
                 $worked = false;
             }
-            if ($this->option('once')) break;
+            if ($this->option('once')) {
+                break;
+            }
             // Bound provider traffic even when many requests are due together.
             sleep($worked ? 2 : 1);
         } while (true);
+
         return self::SUCCESS;
     }
 }

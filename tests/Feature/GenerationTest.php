@@ -1,4 +1,5 @@
 <?php
+
 namespace Tests\Feature;
 
 use App\Models\Generation;
@@ -6,8 +7,10 @@ use App\Models\User;
 use App\Services\GenerationState;
 use App\Services\GenerationWorker;
 use App\Services\Pricing;
+use Illuminate\Cache\RateLimiter;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Http\Client\ConnectionException;
+use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Str;
@@ -48,6 +51,7 @@ class GenerationTest extends TestCase
         $body = json_encode($event);
         $timestamp ??= time();
         $signature = hash_hmac('sha256', $timestamp.'.'.$body, $valid ? 'whsec_test' : 'wrong');
+
         return $this->call('POST', '/webhooks/pixelforge', [], [], [], [
             'CONTENT_TYPE' => 'application/json', 'HTTP_ACCEPT' => 'application/json',
             'HTTP_PIXELFORGE_SIGNATURE' => "t=$timestamp,v1=$signature",
@@ -128,6 +132,7 @@ class GenerationTest extends TestCase
         $generation = $this->generation();
         Http::fake(function ($request) use ($generation) {
             $this->webhook(['id' => 'evt_fast', 'type' => 'generation.succeeded', 'data' => ['object' => $this->object($generation)]])->assertNoContent();
+
             return Http::response($this->object($generation, 'queued'), 202);
         });
         app(GenerationWorker::class)->tick();
@@ -141,17 +146,22 @@ class GenerationTest extends TestCase
         $sent = [];
         Http::fake(function ($request) use (&$sent, $generation) {
             $sent[] = ['method' => $request->method(), 'key' => $request->header('Idempotency-Key'), 'body' => $request->data()];
-            if (count($sent) === 1) throw new ConnectionException('Lost reply');
+            if (count($sent) === 1) {
+                throw new ConnectionException('Lost reply');
+            }
+
             return Http::response($this->object($generation, count($sent) === 2 ? 'queued' : 'succeeded'), 202);
         });
         $worker = app(GenerationWorker::class);
         $worker->tick();
         $this->assertTrue($generation->fresh()->uncertain);
         $this->assertNull($generation->fresh()->actual_cost);
-        $this->travel(3)->seconds(); $worker->tick();
+        $this->travel(3)->seconds();
+        $worker->tick();
         $this->assertSame($sent[0], $sent[1]);
         $this->assertSame([$generation->id], $sent[0]['key']);
-        $this->travel(9)->seconds(); $worker->tick();
+        $this->travel(9)->seconds();
+        $worker->tick();
         $this->assertSame('GET', $sent[2]['method']);
         $this->assertSame('succeeded', $generation->fresh()->status);
     }
@@ -164,7 +174,10 @@ class GenerationTest extends TestCase
         $worker->tick();
         $this->assertGreaterThanOrEqual(44, now()->diffInSeconds($generation->fresh()->next_attempt_at));
         $this->assertFalse($worker->tick());
-        for ($i = 0; $i < 4; $i++) { $this->travel(46)->seconds(); $worker->tick(); }
+        for ($i = 0; $i < 4; $i++) {
+            $this->travel(46)->seconds();
+            $worker->tick();
+        }
         $this->assertSame('failed', $generation->fresh()->status);
         $this->assertSame('0.000000000000000000', $generation->fresh()->actual_cost);
         Http::assertSentCount(5);
@@ -176,14 +189,18 @@ class GenerationTest extends TestCase
         $requests = 0;
         Http::fake(function ($request) use ($generation, &$requests) {
             $requests++;
-            if ($request->method() === 'POST') throw new ConnectionException('Lost reply');
+            if ($request->method() === 'POST') {
+                throw new ConnectionException('Lost reply');
+            }
+
             return Http::response(['data' => [$this->object($generation)], 'has_more' => false]);
         });
         $worker = app(GenerationWorker::class);
         $worker->tick();
         $this->assertTrue($generation->fresh()->reconciling);
         $this->assertNull($generation->fresh()->actual_cost);
-        $this->travel(33)->seconds(); $worker->tick();
+        $this->travel(33)->seconds();
+        $worker->tick();
         $this->assertSame('succeeded', $generation->fresh()->status);
         $this->assertSame(2, $requests);
     }
@@ -274,6 +291,92 @@ class GenerationTest extends TestCase
         $this->assertFalse($paused[0]->fresh()->needs_attention);
         $this->assertSame('processing', $paused[0]->fresh()->status);
         $this->assertNull($paused[0]->fresh()->actual_cost);
+    }
+
+    public function test_generation_requests_validate_options_and_ignore_forged_ownership_and_billing(): void
+    {
+        $user = User::factory()->create();
+        $other = User::factory()->create();
+        $this->actingAs($user)->postJson('/generations', [
+            'prompt' => str_repeat('x', 4001), 'size' => 'tiny', 'quality' => 'invalid',
+            'reference_images' => array_fill(0, 5, 'file:///private/image.png'), 'request_id' => 'not-a-uuid',
+        ])->assertUnprocessable()->assertJsonValidationErrors(['prompt', 'size', 'quality', 'reference_images', 'request_id']);
+        Http::assertNothingSent();
+        Http::fake(['*/pricing' => Http::response($this->pricing())]);
+        $this->post('/generations', [
+            'prompt' => 'A quiet forest', 'size' => '1024x1024', 'quality' => 'medium', 'reference_images' => [],
+            'request_id' => (string) Str::uuid(), 'user_id' => $other->id, 'status' => 'succeeded',
+            'provider_id' => 'gen_forged', 'actual_cost' => '999.00', 'provider_cost' => '888.00',
+        ])->assertRedirect('/studio');
+        $generation = Generation::sole();
+        $this->assertSame($user->id, $generation->user_id);
+        $this->assertSame('queued', $generation->status);
+        $this->assertNull($generation->provider_id);
+        $this->assertNull($generation->actual_cost);
+        $this->assertNull($generation->provider_cost);
+    }
+
+    public function test_history_exposes_only_public_fields_and_safe_image_links(): void
+    {
+        $generation = $this->generation(['image_url' => 'javascript:alert(1)', 'provider_id' => 'gen_private', 'attempts' => 3]);
+        $this->actingAs(User::findOrFail($generation->user_id))->get('/studio')->assertInertia(fn ($page) => $page
+            ->has('generations.data', 1)
+            ->where('generations.data.0.image_url', null)
+            ->where('generations.total', 1)
+            ->where('generations.current_page', 1)
+            ->where('generations.last_page', 1)
+            ->missing('generations.data.0.provider_id')
+            ->missing('generations.data.0.user_id')
+            ->missing('generations.data.0.request_id')
+            ->missing('generations.data.0.attempts')
+            ->missing('generations.data.0.uncertain')
+            ->missing('generations.data.0.reconcile_cursor'));
+    }
+
+    public function test_webhook_authenticates_raw_json_and_preserves_the_complete_provider_object(): void
+    {
+        $generation = $this->generation();
+        $data = $this->object($generation);
+        $data['metadata']['note'] = '  keep these spaces  ';
+        $data['extra_provider_field'] = '';
+        $event = ['id' => 'evt_raw', 'type' => 'generation.succeeded', 'data' => ['object' => $data]];
+        $body = json_encode($event, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES)."\n";
+        $timestamp = time();
+        $signature = hash_hmac('sha256', $timestamp.'.'.$body, 'whsec_test');
+        $headers = ['CONTENT_TYPE' => 'application/json', 'HTTP_PIXELFORGE_SIGNATURE' => "t=$timestamp,v1=$signature"];
+        $this->call('POST', '/webhooks/pixelforge', [], [], [], $headers, $body)->assertNoContent();
+        $stored = json_decode(DB::table('webhook_events')->where('id', 'evt_raw')->value('payload'), true);
+        $this->assertSame('  keep these spaces  ', $stored['data']['object']['metadata']['note']);
+        $this->assertSame('', $stored['data']['object']['extra_provider_field']);
+        $this->assertSame('0.381887500000000000', $generation->fresh()->actual_cost);
+        $this->call('POST', '/webhooks/pixelforge', [], [], [], $headers, json_encode($event))->assertStatus(400);
+        $this->assertDatabaseCount('webhook_events', 1);
+    }
+
+    public function test_malformed_provider_pricing_gives_a_friendly_error_without_accepting_an_order(): void
+    {
+        $pricing = $this->pricing();
+        $pricing['tokens']['reasoning'] = 'invalid';
+        Http::fake(['*/pricing' => Http::response($pricing)]);
+        $input = ['prompt' => 'A forest', 'size' => '1024x1024', 'quality' => 'medium', 'reference_images' => []];
+        $this->actingAs(User::factory()->create())->postJson('/estimate', $input)
+            ->assertStatus(503)->assertJsonPath('message', 'Live pricing is temporarily unavailable. Please try again shortly.');
+        $this->post('/generations', $input + ['request_id' => (string) Str::uuid()])->assertSessionHasErrors('prompt');
+        $this->assertDatabaseCount('generations', 0);
+    }
+
+    public function test_pricing_cache_failure_returns_a_friendly_error_without_provider_io(): void
+    {
+        // Keep request throttling on the real cache before mocking a pricing-cache failure.
+        $this->app->make(RateLimiter::class);
+        Cache::partialMock()->shouldReceive('remember')->once()
+            ->andThrow(new \RuntimeException('Pricing cache unavailable.'));
+
+        $this->actingAs(User::factory()->create())->postJson('/estimate', [
+            'prompt' => 'A forest', 'size' => '1024x1024', 'quality' => 'medium', 'reference_images' => [],
+        ])->assertStatus(503)->assertJsonPath('message', 'Live pricing is temporarily unavailable. Please try again shortly.');
+        Http::assertNothingSent();
+        $this->assertDatabaseCount('generations', 0);
     }
 
     private function pricing(): array

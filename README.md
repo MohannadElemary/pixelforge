@@ -19,6 +19,23 @@ Register `https://YOUR_HOST/webhooks/pixelforge` on the provider key. Local webh
 
 Both services share persistent SQLite storage in the `app-storage` volume. `docker compose -f compose.yaml -p pixelforge down` retains it; deleting the volume deletes accounts and image records. Rebuild after code changes. Run the focused suite with `docker compose -f compose.yaml -p pixelforge exec -u www-data app php artisan test`.
 
+## Formatting
+
+PHP uses Laravel Pint; frontend formatting uses pinned Prettier 3.6.2. From the project directory:
+
+```sh
+docker run --rm -u "$(id -u):$(id -g)" -v "$PWD":/src -w /src --entrypoint php pixelforge-app /var/www/html/vendor/bin/pint --test .
+docker run --rm -u "$(id -u):$(id -g)" -e NPM_CONFIG_CACHE=/tmp/npm-cache -v "$PWD":/app -w /app node:22-alpine sh -c 'npm ci --audit=false && npm run format:check'
+```
+
+Omit `--test` to apply PHP formatting; use `npm run format` to apply frontend formatting.
+
+## Structure
+
+Form Requests validate inputs and authorize retries through `GenerationPolicy`; controllers only coordinate HTTP responses. `AuthService` and `GenerationService` handle account and request workflows. `GenerationState` owns atomic status/billing transitions and webhook deduplication; `GenerationWorker` owns submission and recovery decisions. Concrete user, generation and webhook repositories contain persistence queries and row locks, and `PixelforgeClient` contains provider HTTP calls. History resources expose an explicit, stable response shape without internal retry or correlation fields.
+
+Private Inertia history is encrypted and cleared on logout and guest authentication pages. Login attempts are limited by account/IP pair and by IP, so traffic from another IP cannot exhaust a user’s per-account allowance. Webhooks use a stateless route: signatures authenticate raw bytes before Form Request parsing. Query indexes support owner history, due work and pending events; capacity checks read at most three IDs and event recovery streams in batches.
+
 ## Design
 
 - A generation is saved before any provider call; its UUID is the immutable provider idempotency key and metadata correlation ID. Client request IDs prevent accidental repeat submissions.

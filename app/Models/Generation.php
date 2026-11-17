@@ -9,12 +9,19 @@ class Generation extends Model
 {
     use HasUuids;
 
-    protected $guarded = [];
+    protected $fillable = [
+        'user_id', 'request_id', 'provider_id', 'prompt', 'size', 'quality', 'reference_images',
+        'status', 'estimate', 'rates', 'usage', 'provider_cost', 'actual_cost', 'image_url',
+        'image_url_expires_at', 'message', 'attempts', 'uncertain', 'needs_attention',
+        'reconciling', 'reconcile_cursor', 'reconcile_pages', 'next_attempt_at', 'completed_at',
+    ];
+
     protected $hidden = ['request_id', 'user_id', 'reconcile_cursor'];
 
     protected function casts(): array
     {
         return [
+            'user_id' => 'integer', 'attempts' => 'integer', 'reconcile_pages' => 'integer',
             'reference_images' => 'array', 'estimate' => 'array', 'rates' => 'array', 'usage' => 'array',
             'uncertain' => 'boolean', 'needs_attention' => 'boolean', 'reconciling' => 'boolean',
             'next_attempt_at' => 'datetime', 'completed_at' => 'datetime', 'image_url_expires_at' => 'datetime',
@@ -24,13 +31,5 @@ class Generation extends Model
     public function terminal(): bool
     {
         return in_array($this->status, ['succeeded', 'failed'], true);
-    }
-
-    public function providerPayload(): array
-    {
-        return [
-            'prompt' => $this->prompt, 'size' => $this->size, 'quality' => $this->quality,
-            'reference_images' => $this->reference_images, 'metadata' => ['generation_id' => $this->id],
-        ];
     }
 }

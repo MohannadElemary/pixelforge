@@ -1,36 +1,56 @@
 <?php
+
 namespace App\Http\Controllers;
-use App\Models\User;
+
+use App\Exceptions\InvalidCredentialsException;
+use App\Http\Requests\LoginRequest;
+use App\Http\Requests\RegisterRequest;
+use App\Services\AuthService;
+use Illuminate\Http\RedirectResponse;
 use Illuminate\Http\Request;
-use Illuminate\Support\Facades\Auth;
-use Illuminate\Validation\Rules\Password;
 use Illuminate\Validation\ValidationException;
 use Inertia\Inertia;
+use Inertia\Response;
+
 class AuthController extends Controller
 {
-    public function show(Request $request) { return Inertia::render('Auth', ['register' => $request->routeIs('register')]); }
-    public function register(Request $request)
+    public function __construct(private readonly AuthService $auth) {}
+
+    public function show(Request $request): Response
     {
-        $data = $request->validate(['name' => 'required|string|max:100', 'email' => 'required|email|max:255|unique:users',
-            'password' => ['required', 'confirmed', Password::min(10)]]);
-        Auth::login(User::create($data));
+        Inertia::clearHistory();
+
+        return Inertia::render('Auth', ['register' => $request->routeIs('register')]);
+    }
+
+    public function register(RegisterRequest $request): RedirectResponse
+    {
+        $this->auth->register($request->validated());
         $request->session()->regenerate();
+
         return redirect('/studio');
     }
-    public function login(Request $request)
+
+    public function login(LoginRequest $request): RedirectResponse
     {
-        $data = $request->validate(['email' => 'required|email', 'password' => 'required|string']);
-        if (!Auth::attempt($data, $request->boolean('remember'))) {
-            throw ValidationException::withMessages(['email' => 'These sign-in details do not match our records.']);
+        try {
+            $this->auth->login($request->validated());
+        } catch (InvalidCredentialsException $exception) {
+            throw ValidationException::withMessages(['email' => $exception->getMessage()]);
         }
+
         $request->session()->regenerate();
+
         return redirect()->intended('/studio');
     }
-    public function logout(Request $request)
+
+    public function logout(Request $request): RedirectResponse
     {
-        Auth::logout();
+        $this->auth->logout();
         $request->session()->invalidate();
         $request->session()->regenerateToken();
+        Inertia::clearHistory();
+
         return redirect('/login');
     }
 }
