@@ -16,12 +16,28 @@ services:
   worker:
     image: pixelforge-app
     env_file: .env
-    command: ["php", "artisan", "pixelforge:work"]
+    user: www-data
+    entrypoint: ["php"]
+    command: ["artisan", "queue:work", "--queue=generations", "--sleep=1", "--tries=0", "--timeout=45", "--max-time=3600"]
     volumes:
       - app-storage:/var/www/html/storage
     depends_on:
       app:
         condition: service_healthy
     restart: unless-stopped
+    stop_grace_period: 60s
+  scheduler:
+    image: pixelforge-app
+    env_file: .env
+    user: www-data
+    entrypoint: ["php"]
+    command: ["artisan", "schedule:work"]
+    volumes:
+      - app-storage:/var/www/html/storage
+    depends_on:
+      app:
+        condition: service_healthy
+    restart: unless-stopped
+    stop_grace_period: 60s
 volumes:
   app-storage:

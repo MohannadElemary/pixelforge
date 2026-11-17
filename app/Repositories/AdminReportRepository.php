@@ -2,29 +2,25 @@
 
 namespace App\Repositories;
 
-use Carbon\CarbonImmutable;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\LazyCollection;
 
 class AdminReportRepository
 {
-    public function completedBetween(string $startDate, string $endDate): LazyCollection
+    public function summariesBetween(string $startDate, string $endDate): LazyCollection
     {
-        return DB::table('generations')
-            ->join('users', 'users.id', '=', 'generations.user_id')
-            ->where('generations.status', 'succeeded')
-            ->where('generations.completed_at', '>=', $startDate.' 00:00:00')
-            ->where('generations.completed_at', '<', CarbonImmutable::parse($endDate, 'UTC')->addDay()->format('Y-m-d 00:00:00'))
+        return DB::table('report_summaries')
+            ->join('users', 'users.id', '=', 'report_summaries.user_id')
+            ->whereBetween('report_summaries.date', [$startDate, $endDate])
             ->select([
-                'generations.id', 'generations.user_id', 'users.name', 'users.email',
-                'generations.completed_at', 'generations.actual_cost', 'generations.provider_cost',
-                'generations.provider_key_fingerprint',
+                'report_summaries.date', 'report_summaries.user_id', 'users.name', 'users.email',
+                'report_summaries.generations', 'report_summaries.credit_spend', 'report_summaries.provider_cost',
+                'report_summaries.provider_key_fingerprint',
             ])
-            // Completion timestamps are stored in UTC. Both SQLite and MySQL support DATE().
-            ->orderByRaw('DATE(generations.completed_at) DESC')
-            ->orderBy('generations.user_id')
-            ->orderBy('generations.id')
-            // One SELECT keeps concurrent completions from shifting offset-based batches.
+            ->orderByDesc('report_summaries.date')
+            ->orderBy('report_summaries.user_id')
+            ->orderBy('report_summaries.provider_key_fingerprint')
+            // One snapshot supplies totals and pagination; reads scale by groups, not images.
             ->cursor();
     }
 }

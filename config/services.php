@@ -5,6 +5,8 @@ return [
         'url' => env('PIXELFORGE_URL', 'https://pixelforge.promptedit.dev/v1'),
         'key' => env('PIXELFORGE_API_KEY'),
         'webhook_secret' => env('PIXELFORGE_WEBHOOK_SECRET'),
+        'concurrency_limit' => (int) env('PIXELFORGE_CONCURRENCY_LIMIT', 3),
+        'request_interval_ms' => (int) env('PIXELFORGE_REQUEST_INTERVAL_MS', 1000),
     ],
 
     /*

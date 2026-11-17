@@ -4,6 +4,7 @@ namespace App\Services;
 
 use App\Models\Generation;
 use App\Repositories\GenerationRepository;
+use App\Repositories\ReportSummaryRepository;
 use App\Repositories\WebhookEventRepository;
 use Illuminate\Support\Facades\DB;
 use UnexpectedValueException;
@@ -15,6 +16,8 @@ class GenerationStateService
         private readonly GenerationRepository $generationRepository,
         private readonly WebhookEventRepository $webhookEventRepository,
         private readonly WalletService $walletService,
+        private readonly ReportSummaryRepository $reportSummaryRepository,
+        private readonly GenerationQueueService $generationQueueService,
     ) {}
 
     public function apply(array $data, ?string $localId = null): bool
@@ -43,8 +46,10 @@ class GenerationStateService
                 return true;
             }
 
+            $wasPaused = $generation->needs_attention;
             $generation->fill([
                 'provider_id' => $providerId,
+                'provider_slot_reserved' => true,
                 'uncertain' => false,
                 'reconciling' => false,
                 'needs_attention' => false,
@@ -84,10 +89,17 @@ class GenerationStateService
             if ($generation->terminal()) {
                 $generation->completed_at = $data['completed_at'] ?? now();
                 $generation->next_attempt_at = null;
+                $generation->provider_slot_reserved = false;
                 $this->walletService->settle($generation, $generation->actual_cost);
             }
 
             $this->generationRepository->save($generation);
+            if ($generation->status === 'succeeded') {
+                $this->reportSummaryRepository->recordSuccess($generation);
+            }
+            if ($wasPaused && ! $generation->terminal()) {
+                $this->generationQueueService->dispatch($generation);
+            }
 
             return true;
         }, 5);

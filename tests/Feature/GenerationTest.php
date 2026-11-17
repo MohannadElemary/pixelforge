@@ -36,7 +36,8 @@ class GenerationTest extends TestCase
     {
         return Generation::create($values + ['user_id' => User::factory()->create()->id, 'request_id' => (string) Str::uuid(),
             'prompt' => 'Quiet forest', 'size' => '1024x1024', 'quality' => 'medium', 'reference_images' => [],
-            'estimate' => ['typical' => '0.07'], 'next_attempt_at' => now()]);
+            'estimate' => ['typical' => '0.07'], 'next_attempt_at' => now(),
+            'provider_slot_reserved' => isset($values['provider_id']) || ($values['uncertain'] ?? false) || ($values['reconciling'] ?? false)]);
     }
 
     private function object(Generation $generation, string $status = 'succeeded'): array
@@ -136,7 +137,7 @@ class GenerationTest extends TestCase
 
             return Http::response($this->object($generation, 'queued'), 202);
         });
-        app(GenerationWorkerService::class)->tick();
+        app(GenerationWorkerService::class)->process($generation->id);
         $this->assertSame('succeeded', $generation->fresh()->status);
         $this->assertSame('0.381887500000000000', $generation->fresh()->actual_cost);
     }
@@ -154,30 +155,31 @@ class GenerationTest extends TestCase
             return Http::response($this->object($generation, count($sent) === 2 ? 'queued' : 'succeeded'), 202);
         });
         $generationWorkerService = app(GenerationWorkerService::class);
-        $generationWorkerService->tick();
+        $generationWorkerService->process($generation->id);
         $this->assertTrue($generation->fresh()->uncertain);
         $this->assertNull($generation->fresh()->actual_cost);
         $this->travel(3)->seconds();
-        $generationWorkerService->tick();
+        $generationWorkerService->process($generation->id);
         $this->assertSame($sent[0], $sent[1]);
         $this->assertSame([$generation->id], $sent[0]['key']);
         $this->travel(9)->seconds();
-        $generationWorkerService->tick();
+        $generationWorkerService->process($generation->id);
         $this->assertSame('GET', $sent[2]['method']);
         $this->assertSame('succeeded', $generation->fresh()->status);
     }
 
     public function test_busy_provider_respects_retry_after_and_stops_after_five_rejections(): void
     {
+        $this->freezeTime();
         $generation = $this->generation();
         Http::fake(['*' => Http::response(['error' => ['code' => 'concurrency_limit_exceeded']], 429, ['Retry-After' => '45'])]);
         $generationWorkerService = app(GenerationWorkerService::class);
-        $generationWorkerService->tick();
+        $generationWorkerService->process($generation->id);
         $this->assertGreaterThanOrEqual(44, now()->diffInSeconds($generation->fresh()->next_attempt_at));
-        $this->assertFalse($generationWorkerService->tick());
+        $this->assertFalse($generationWorkerService->process($generation->id));
         for ($i = 0; $i < 4; $i++) {
             $this->travel(46)->seconds();
-            $generationWorkerService->tick();
+            $generationWorkerService->process($generation->id);
         }
         $this->assertSame('failed', $generation->fresh()->status);
         $this->assertSame('0.000000000000000000', $generation->fresh()->actual_cost);
@@ -197,11 +199,11 @@ class GenerationTest extends TestCase
             return Http::response(['data' => [$this->object($generation)], 'has_more' => false]);
         });
         $generationWorkerService = app(GenerationWorkerService::class);
-        $generationWorkerService->tick();
+        $generationWorkerService->process($generation->id);
         $this->assertTrue($generation->fresh()->reconciling);
         $this->assertNull($generation->fresh()->actual_cost);
         $this->travel(33)->seconds();
-        $generationWorkerService->tick();
+        $generationWorkerService->process($generation->id);
         $this->assertSame('succeeded', $generation->fresh()->status);
         $this->assertSame(2, $requests);
     }
@@ -215,6 +217,8 @@ class GenerationTest extends TestCase
         $this->actingAs($user)->post('/generations', $input)->assertRedirect('/studio');
         $this->post('/generations', $input)->assertRedirect('/studio');
         $this->assertDatabaseCount('generations', 1);
+        $this->assertDatabaseCount('jobs', 1);
+        $this->assertSame(Generation::sole()->queue_job_uuid, DB::table('jobs')->value('uuid'));
         $this->post('/generations', array_replace($input, ['prompt' => 'Changed']))->assertSessionHasErrors('prompt');
         $other = $this->generation(['needs_attention' => true]);
         $this->post('/generations/'.$other->id.'/retry')->assertNotFound();
@@ -237,14 +241,15 @@ class GenerationTest extends TestCase
         Http::fake(['*' => Http::response(['error' => ['code' => 'daily_limit_exceeded']], 429)]);
         $known = $this->generation();
         $generationWorkerService = app(GenerationWorkerService::class);
-        $generationWorkerService->tick();
+        $generationWorkerService->process($known->id);
         $known->refresh();
         $this->assertSame('failed', $known->status);
         $this->assertSame('0.000000000000000000', $known->actual_cost);
         $this->assertStringContainsString('daily generation limit', $known->message);
         $this->assertSame(1, $known->attempts);
+        $this->travel(2)->seconds();
         $ambiguous = $this->generation(['uncertain' => true]);
-        $generationWorkerService->tick();
+        $generationWorkerService->process($ambiguous->id);
         $this->assertNull($ambiguous->fresh()->actual_cost);
         $this->assertSame('queued', $ambiguous->fresh()->status);
         $this->assertTrue($ambiguous->fresh()->needs_attention);
@@ -260,19 +265,20 @@ class GenerationTest extends TestCase
         $waiting = $this->generation(['attempts' => 2]);
         Http::fake(['*' => Http::response($this->object($waiting, 'queued'), 202)]);
         $generationWorkerService = app(GenerationWorkerService::class);
-        $this->assertFalse($generationWorkerService->tick());
+        $this->assertFalse($generationWorkerService->process($waiting->id));
         $this->assertSame(2, $waiting->fresh()->attempts);
         $this->assertSame('queued', $waiting->fresh()->status);
         Http::assertNothingSent();
         $completed = $this->object($active[0]);
         $completed['id'] = $active[0]->provider_id;
         app(GenerationStateService::class)->apply($completed);
-        $this->assertTrue($generationWorkerService->tick());
+        $this->travel(6)->seconds();
+        $this->assertTrue($generationWorkerService->process($waiting->id));
         $this->assertNotNull($waiting->fresh()->provider_id);
         Http::assertSentCount(1);
     }
 
-    public function test_paused_provider_requests_do_not_block_new_images_and_remain_resumable(): void
+    public function test_paused_provider_requests_keep_their_slots_and_remain_resumable(): void
     {
         $paused = [];
         for ($i = 0; $i < 3; $i++) {
@@ -280,9 +286,9 @@ class GenerationTest extends TestCase
         }
         $waiting = $this->generation();
         Http::fake(['*' => Http::response($this->object($waiting, 'queued'), 202)]);
-        $this->assertTrue(app(GenerationWorkerService::class)->tick());
-        $this->assertNotNull($waiting->fresh()->provider_id);
-        Http::assertSentCount(1);
+        $this->assertFalse(app(GenerationWorkerService::class)->process($waiting->id));
+        $this->assertNull($waiting->fresh()->provider_id);
+        Http::assertNothingSent();
         foreach ($paused as $generation) {
             $this->assertTrue($generation->fresh()->needs_attention);
             $this->assertSame('processing', $generation->fresh()->status);
@@ -290,6 +296,8 @@ class GenerationTest extends TestCase
         }
         $this->actingAs(User::findOrFail($paused[0]->user_id))
             ->post('/generations/'.$paused[0]->id.'/retry')->assertRedirect();
+        $this->assertDatabaseCount('jobs', 1);
+        $this->assertSame($paused[0]->fresh()->queue_job_uuid, DB::table('jobs')->value('uuid'));
         $this->assertFalse($paused[0]->fresh()->needs_attention);
         $this->assertSame('processing', $paused[0]->fresh()->status);
         $this->assertNull($paused[0]->fresh()->actual_cost);

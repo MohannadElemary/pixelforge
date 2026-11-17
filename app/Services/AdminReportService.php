@@ -35,33 +35,33 @@ class AdminReportService
         $entryCount = 0;
         $offset = ($page - 1) * 50;
 
-        foreach ($this->adminReportRepository->completedBetween($filters['start_date'], $filters['end_date']) as $generation) {
-            $date = substr($generation->completed_at, 0, 10);
-            $isCurrent = $fingerprint !== null && $generation->provider_key_fingerprint === $fingerprint;
+        foreach ($this->adminReportRepository->summariesBetween($filters['start_date'], $filters['end_date']) as $summary) {
+            $date = $summary->date;
+            $isCurrent = $fingerprint !== null && $summary->provider_key_fingerprint === $fingerprint;
             if ($isCurrent) {
-                $currentDays[$date]['generations']++;
-                $currentDays[$date]['provider_cost'] = bcadd($currentDays[$date]['provider_cost'], $generation->provider_cost, 18);
-            } elseif ($generation->provider_key_fingerprint === null) {
-                $unscoped = bcadd($unscoped, $generation->provider_cost, 18);
+                $currentDays[$date]['generations'] += (int) $summary->generations;
+                $currentDays[$date]['provider_cost'] = bcadd($currentDays[$date]['provider_cost'], $summary->provider_cost, 18);
+            } elseif ($summary->provider_key_fingerprint === '') {
+                $unscoped = bcadd($unscoped, $summary->provider_cost, 18);
             } else {
-                $otherKeys = bcadd($otherKeys, $generation->provider_cost, 18);
+                $otherKeys = bcadd($otherKeys, $summary->provider_cost, 18);
             }
             if ($filters['scope'] === 'current' && ! $isCurrent) {
                 continue;
             }
 
-            $this->addGeneration($totals, $generation);
-            $this->addGeneration($days[$date], $generation);
-            if ($entry === null || $entry['date'] !== $date || $entry['user_id'] !== (int) $generation->user_id) {
+            $this->addSummary($totals, $summary);
+            $this->addSummary($days[$date], $summary);
+            if ($entry === null || $entry['date'] !== $date || $entry['user_id'] !== (int) $summary->user_id) {
                 if ($entry !== null) {
                     $this->collectEntry($entries, $entry, $entryCount, $offset);
                 }
                 $entry = [
-                    'date' => $date, 'user_id' => (int) $generation->user_id,
-                    'name' => $generation->name, 'email' => $generation->email,
+                    'date' => $date, 'user_id' => (int) $summary->user_id,
+                    'name' => $summary->name, 'email' => $summary->email,
                 ] + $this->emptyTotals();
             }
-            $this->addGeneration($entry, $generation);
+            $this->addSummary($entry, $summary);
         }
         if ($entry !== null) {
             $this->collectEntry($entries, $entry, $entryCount, $offset);
@@ -83,11 +83,11 @@ class AdminReportService
         return ['generations' => 0, 'credit_spend' => PricingService::ZERO, 'provider_cost' => PricingService::ZERO, 'profit' => PricingService::ZERO];
     }
 
-    private function addGeneration(array &$totals, object $generation): void
+    private function addSummary(array &$totals, object $summary): void
     {
-        $totals['generations']++;
-        $totals['credit_spend'] = bcadd($totals['credit_spend'], $generation->actual_cost, 18);
-        $totals['provider_cost'] = bcadd($totals['provider_cost'], $generation->provider_cost, 18);
+        $totals['generations'] += (int) $summary->generations;
+        $totals['credit_spend'] = bcadd($totals['credit_spend'], $summary->credit_spend, 18);
+        $totals['provider_cost'] = bcadd($totals['provider_cost'], $summary->provider_cost, 18);
         $totals['profit'] = bcsub($totals['credit_spend'], $totals['provider_cost'], 18);
     }
 

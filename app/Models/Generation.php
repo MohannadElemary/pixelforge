@@ -15,6 +15,7 @@ class Generation extends Model
         'image_url_expires_at', 'message', 'attempts', 'uncertain', 'needs_attention',
         'reconciling', 'reconcile_cursor', 'reconcile_pages', 'next_attempt_at', 'completed_at',
         'reserved_cost', 'reservation_tokens', 'wallet_settled_at', 'provider_key_fingerprint',
+        'provider_slot_reserved', 'queue_job_uuid',
     ];
 
     protected $hidden = ['request_id', 'user_id', 'reconcile_cursor', 'provider_key_fingerprint'];
@@ -24,6 +25,7 @@ class Generation extends Model
         return [
             'user_id' => 'integer', 'attempts' => 'integer', 'reconcile_pages' => 'integer',
             'reservation_tokens' => 'array', 'wallet_settled_at' => 'datetime',
+            'provider_slot_reserved' => 'boolean',
             'reference_images' => 'array', 'estimate' => 'array', 'rates' => 'array', 'usage' => 'array',
             'uncertain' => 'boolean', 'needs_attention' => 'boolean', 'reconciling' => 'boolean',
             'next_attempt_at' => 'datetime', 'completed_at' => 'datetime', 'image_url_expires_at' => 'datetime',

@@ -101,7 +101,7 @@ class WalletTest extends TestCase
         Http::fake(['*/pricing' => Http::response($this->pricing())]);
         $generation = $this->submit($user);
         Http::fake(['*/pricing' => Http::response($this->pricing()), '*/generations' => fn () => throw new ConnectionException('Lost response')]);
-        app(GenerationWorkerService::class)->tick();
+        app(GenerationWorkerService::class)->process($generation->id);
         $this->assertTrue($generation->fresh()->uncertain);
         $this->assertSame('3.750000000000000000', $user->fresh()->credit_reserved);
         $this->assertNull($generation->fresh()->wallet_settled_at);
@@ -118,7 +118,7 @@ class WalletTest extends TestCase
         $user = User::factory()->create();
         $this->fund($user);
         $generation = $this->submit($user);
-        app(GenerationWorkerService::class)->tick();
+        app(GenerationWorkerService::class)->process($generation->id);
         $this->assertSame('failed', $generation->fresh()->status);
         $this->assertSame(PricingService::ZERO, $generation->fresh()->actual_cost);
         $this->assertSame(PricingService::ZERO, $user->fresh()->credit_reserved);
@@ -132,7 +132,7 @@ class WalletTest extends TestCase
         $user = User::factory()->create();
         $this->fund($user);
         $generation = $this->submit($user);
-        app(GenerationWorkerService::class)->tick();
+        app(GenerationWorkerService::class)->process($generation->id);
         $this->assertSame('failed', $generation->fresh()->status);
         $this->assertFalse($generation->fresh()->uncertain);
         $this->assertNotNull($generation->fresh()->wallet_settled_at);
@@ -180,7 +180,7 @@ class WalletTest extends TestCase
         $generation->fill(['uncertain' => true])->save();
         config(['services.pixelforge.key' => 'different-account-key']);
         Http::fake();
-        app(GenerationWorkerService::class)->tick();
+        app(GenerationWorkerService::class)->process($generation->id);
         Http::assertNothingSent();
         $this->assertTrue($generation->fresh()->needs_attention);
         $this->assertNull($generation->fresh()->actual_cost);
@@ -189,7 +189,7 @@ class WalletTest extends TestCase
             'provider_id' => 'gen_accepted', 'uncertain' => false, 'needs_attention' => false,
             'next_attempt_at' => now(), 'attempts' => 0,
         ])->save();
-        app(GenerationWorkerService::class)->tick();
+        app(GenerationWorkerService::class)->process($generation->id);
         Http::assertNothingSent();
         $this->assertTrue($generation->fresh()->needs_attention);
         $this->assertNull($generation->fresh()->actual_cost);

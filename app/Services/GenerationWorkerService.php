@@ -3,9 +3,11 @@
 namespace App\Services;
 
 use App\Clients\PixelforgeClient;
+use App\Exceptions\ProviderRateLimitException;
 use App\Exceptions\WalletException;
 use App\Models\Generation;
 use App\Repositories\GenerationRepository;
+use App\Repositories\ProviderControlRepository;
 use Illuminate\Http\Client\ConnectionException;
 use Illuminate\Http\Client\Response;
 use Illuminate\Support\Facades\DB;
@@ -17,19 +19,19 @@ class GenerationWorkerService
 {
     private const MAX_ATTEMPTS = 5;
 
-    private const CONCURRENCY_LIMIT = 3;
-
     public function __construct(
         private readonly GenerationStateService $generationStateService,
         private readonly GenerationRepository $generationRepository,
         private readonly PixelforgeClient $pixelforgeClient,
         private readonly PricingService $pricingService,
         private readonly WalletService $walletService,
+        private readonly ProviderControlRepository $providerControlRepository,
+        private readonly ProviderRateLimitService $providerRateLimitService,
     ) {}
 
-    public function tick(): bool
+    public function process(string $generationId, ?string $jobUuid = null): bool
     {
-        $generation = $this->claim();
+        $generation = $this->claim($generationId, $jobUuid);
 
         if ($generation === null) {
             return false;
@@ -39,6 +41,7 @@ class GenerationWorkerService
             $this->update($generation, [
                 'needs_attention' => true,
                 'message' => 'Generation is paused while the service connection is configured.',
+                'provider_slot_reserved' => $generation->uncertain || $generation->provider_id !== null || $generation->reconciling,
             ]);
 
             return true;
@@ -84,9 +87,8 @@ class GenerationWorkerService
             } elseif ($generation->provider_id) {
                 $response = $this->pixelforgeClient->retrieve($generation->provider_id);
             } else {
-                // Persist uncertainty without changing the claim's previous outcome knowledge.
-                $this->update($generation, ['uncertain' => true]);
-                $response = $this->pixelforgeClient->submit($generation);
+                // Rate admission precedes uncertainty; persist it immediately before sending.
+                $response = $this->pixelforgeClient->submit($generation, fn () => $this->update($generation, ['uncertain' => true]));
             }
 
             if (! $response->successful()) {
@@ -97,6 +99,12 @@ class GenerationWorkerService
                 $this->generationStateService->apply($response->json(), $generation->id);
                 $this->generationStateService->pendingEvents($this->generationRepository->find($generation->id));
             }
+        } catch (ProviderRateLimitException $exception) {
+            $this->update($generation, [
+                'attempts' => $generation->attempts - 1,
+                'next_attempt_at' => now()->addSeconds($exception->retryAfter),
+                'provider_slot_reserved' => $generation->uncertain || $generation->provider_id !== null || $generation->reconciling,
+            ]);
         } catch (ConnectionException) {
             $this->retry($generation, 'The provider is taking longer to respond. Checking safely for your image.', true);
         } catch (UnexpectedValueException|TypeError $exception) {
@@ -120,7 +128,7 @@ class GenerationWorkerService
                 $this->walletService->settle($current, PricingService::ZERO);
                 $this->generationRepository->save($current, [
                     'status' => 'failed', 'provider_cost' => PricingService::ZERO, 'actual_cost' => PricingService::ZERO,
-                    'completed_at' => now(), 'next_attempt_at' => null,
+                    'completed_at' => now(), 'next_attempt_at' => null, 'provider_slot_reserved' => false,
                     'message' => 'Prices changed and your available credits no longer cover this image. You were not charged.',
                 ]);
 
@@ -135,19 +143,40 @@ class GenerationWorkerService
         }, 5);
     }
 
-    private function claim(): ?Generation
+    public function nextDelay(string $generationId, ?string $jobUuid = null): ?int
     {
-        return DB::transaction(function (): ?Generation {
-            $capacityFull = $this->generationRepository->capacityIsFull(self::CONCURRENCY_LIMIT);
-            $generation = $this->generationRepository->nextDueForUpdate($capacityFull);
+        $generation = $this->generationRepository->findOptional($generationId);
+        if ($generation === null || ($jobUuid !== null && $generation->queue_job_uuid !== $jobUuid)
+            || $generation->terminal() || $generation->needs_attention || $generation->next_attempt_at === null) {
+            return null;
+        }
 
-            if ($generation !== null) {
-                // Persist the attempt before I/O; an interrupted process still consumes an attempt.
-                $this->generationRepository->save($generation, [
-                    'attempts' => $generation->attempts + 1,
-                    'next_attempt_at' => now()->addSeconds(60),
-                ]);
+        return max(1, (int) ceil(now()->diffInSeconds($generation->next_attempt_at, false)));
+    }
+
+    private function claim(string $generationId, ?string $jobUuid): ?Generation
+    {
+        return DB::transaction(function () use ($generationId, $jobUuid): ?Generation {
+            // Serialize admissions across workers before checking their shared capacity.
+            $this->providerControlRepository->lock();
+            $generation = $this->generationRepository->findOptionalForUpdate($generationId);
+            if ($generation === null || ($jobUuid !== null && $generation->queue_job_uuid !== $jobUuid)
+                || $generation->terminal() || $generation->needs_attention
+                || $generation->next_attempt_at === null || $generation->next_attempt_at->isFuture()) {
+                return null;
             }
+            $limit = min(3, max(1, (int) config('services.pixelforge.concurrency_limit', 3)));
+            if (! $generation->provider_slot_reserved && $this->generationRepository->capacityIsFull($limit)) {
+                $this->generationRepository->save($generation, ['next_attempt_at' => now()->addSeconds(5)]);
+
+                return null;
+            }
+            // A hard crash cannot free an unresolved provider slot; the durable due time recovers work.
+            $this->generationRepository->save($generation, [
+                'provider_slot_reserved' => true,
+                'attempts' => $generation->attempts + 1,
+                'next_attempt_at' => now()->addSeconds(120),
+            ]);
 
             return $generation;
         }, 5);
@@ -173,7 +202,7 @@ class GenerationWorkerService
         );
 
         if ($retryable) {
-            $this->retry($generation, 'The provider is busy. Your request will retry automatically.', $uncertain, (int) $response->header('Retry-After'));
+            $this->retry($generation, 'The provider is busy. Your request will retry automatically.', $uncertain, $this->providerRateLimitService->retryAfter($response));
         } elseif (! $generation->provider_id && ! $generation->reconciling && ! $uncertain) {
             $this->update($generation, [
                 'status' => 'failed',
@@ -204,6 +233,7 @@ class GenerationWorkerService
             'uncertain' => $uncertain,
             'message' => $message,
             'next_attempt_at' => now()->addSeconds($delay),
+            'provider_slot_reserved' => $uncertain || $generation->provider_id !== null || $generation->reconciling,
         ];
 
         if ($generation->attempts >= self::MAX_ATTEMPTS) {
@@ -279,6 +309,7 @@ class GenerationWorkerService
 
             $current->fill($values);
             if ($current->status === 'failed') {
+                $current->provider_slot_reserved = false;
                 $this->walletService->settle($current, PricingService::ZERO);
             }
             $this->generationRepository->save($current);

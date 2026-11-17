@@ -20,6 +20,7 @@ class GenerationService
         private readonly PixelforgeClient $pixelforgeClient,
         private readonly WalletService $walletService,
         private readonly WalletRepository $walletRepository,
+        private readonly GenerationQueueService $generationQueueService,
     ) {}
 
     public function configured(): bool
@@ -76,7 +77,10 @@ class GenerationService
                 }
                 $this->walletService->reserve($user, $estimate['max']);
 
-                return $this->generationRepository->createRequest($userId, $requestId, $input, $estimate, $this->pixelforgeClient->keyFingerprint());
+                $generation = $this->generationRepository->createRequest($userId, $requestId, $input, $estimate, $this->pixelforgeClient->keyFingerprint());
+                $this->generationQueueService->dispatch($generation);
+
+                return $generation;
             }, 5);
         } catch (WalletException $exception) {
             throw new GenerationRequestException($exception->getMessage(), previous: $exception);
@@ -110,6 +114,7 @@ class GenerationService
                 'next_attempt_at' => now(),
                 'message' => 'Checking again safely.',
             ]);
+            $this->generationQueueService->dispatch($generation);
         }, 5);
     }
 }

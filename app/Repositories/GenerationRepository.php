@@ -5,9 +5,12 @@ namespace App\Repositories;
 use App\Models\Generation;
 use Illuminate\Contracts\Pagination\LengthAwarePaginator;
 use Illuminate\Database\Eloquent\Builder;
+use Illuminate\Database\Eloquent\Collection;
 
 class GenerationRepository
 {
+    public function __construct(private readonly GenerationQueueRepository $generationQueueRepository) {}
+
     public function historyForUser(int $userId): LengthAwarePaginator
     {
         return Generation::query()
@@ -39,27 +42,29 @@ class GenerationRepository
 
     public function capacityIsFull(int $limit): bool
     {
-        return $this->pending()
-            ->whereNotNull('provider_id')
-            ->where('needs_attention', false)
-            ->limit($limit)
-            ->pluck('id')
-            ->count() >= $limit;
+        // Current locking read follows the shared admission lock, including on MySQL.
+        return Generation::query()->where('provider_slot_reserved', true)
+            ->limit($limit)->lockForUpdate()->pluck('id')->count() >= $limit;
     }
 
-    public function nextDueForUpdate(bool $existingOnly): ?Generation
+    public function overdueForDispatch(): Collection
     {
-        return $this->pending()
-            ->when($existingOnly, fn (Builder $query) => $query->where(fn (Builder $query) => $query
-                ->whereNotNull('provider_id')
-                ->orWhere('uncertain', true)
-                ->orWhere('reconciling', true)))
-            ->where('needs_attention', false)
-            ->where('next_attempt_at', '<=', now())
-            ->orderBy('next_attempt_at')
-            ->orderBy('id')
-            ->lockForUpdate()
-            ->first();
+        return $this->pending()->where('needs_attention', false)
+            ->where('next_attempt_at', '<=', now()->subMinute())
+            ->whereNotExists($this->generationQueueRepository->jobs()->selectRaw('1')
+                ->whereColumn('uuid', 'generations.queue_job_uuid'))
+            ->orderBy('next_attempt_at')->orderBy('id')
+            ->limit(100)->get();
+    }
+
+    public function findOptionalForUpdate(string $id): ?Generation
+    {
+        return Generation::query()->whereKey($id)->lockForUpdate()->first();
+    }
+
+    public function findOptional(string $id): ?Generation
+    {
+        return Generation::query()->find($id);
     }
 
     public function findForUpdate(string $id): Generation
