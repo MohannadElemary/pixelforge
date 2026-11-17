@@ -1,0 +1,10 @@
+#!/bin/sh
+set -eu
+mkdir -p storage/database storage/framework/cache/data storage/framework/sessions storage/framework/views storage/logs
+touch storage/database/database.sqlite
+chown -R www-data:www-data storage bootstrap/cache
+if [ "$1" = "apache2-foreground" ]; then
+    runuser -u www-data -- php artisan migrate --force
+    exec "$@"
+fi
+exec runuser -u www-data -- "$@"

@@ -1,0 +1,27 @@
+services:
+  app:
+    build: .
+    image: pixelforge-app
+    ports:
+      - "127.0.0.1:${APP_PORT:-8088}:80"
+    env_file: .env
+    volumes:
+      - app-storage:/var/www/html/storage
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "php", "-r", "exit(@file_get_contents('http://127.0.0.1/up') === false ? 1 : 0);"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+  worker:
+    image: pixelforge-app
+    env_file: .env
+    command: ["php", "artisan", "pixelforge:work"]
+    volumes:
+      - app-storage:/var/www/html/storage
+    depends_on:
+      app:
+        condition: service_healthy
+    restart: unless-stopped
+volumes:
+  app-storage:
